@@ -36,7 +36,7 @@ test('legacy HTML retains local policy runner and security declaration',()=>{
 function response() {
  return {statusCode:200,headers:{},setHeader(k,v){this.headers[k]=v;return this;},status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
 }
-const safeRequest = {method:'POST',headers:{origin:'https://example.vercel.app',host:'example.vercel.app'},body:{apiKey:'sk-test-do-not-use-this-key',model:'gpt-6-luna',mode:'analysis',question:'',evidence:ai.buildEvidence(report)}};
+const safeRequest = {method:'POST',headers:{origin:'https://example.vercel.app',host:'example.vercel.app'},body:{apiKey:'sk-or-v1-test-do-not-use-this-key',model:'openrouter/free',mode:'analysis',question:'',evidence:ai.buildEvidence(report)}};
 test('API rejects non-POST, cross-origin and malformed / missing keys',async()=>{
  let r=response();await handler({method:'GET',headers:{}},r);assert.equal(r.statusCode,405);
  r=response();await handler({...safeRequest,headers:{origin:'https://evil.com',host:'example.vercel.app'}},r);assert.equal(r.statusCode,403);
@@ -44,10 +44,30 @@ test('API rejects non-POST, cross-origin and malformed / missing keys',async()=>
  r=response();await handler({...safeRequest,body:{...safeRequest.body,model:'unsupported'}},r);assert.equal(r.statusCode,400);
  r=response();await handler({...safeRequest,body:{...safeRequest.body,mode:'question',question:''}},r);assert.equal(r.statusCode,400);
 });
-test('API proxy forwards key only to OpenAI and requests no server-side model storage',async()=>{
+test('API proxy uses OpenRouter free router, forwards only reduced evidence, and validates structured output',async()=>{
  let forwarded;const old=global.fetch;
- global.fetch=async(url,options)=>{forwarded={url,options};return {ok:true,status:200,json:async()=>({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({headline:'Review',executive_summary:'Two duplicate claims require review.',findings:[{title:'Potential duplicate',impact:'$99 held across two claims.',evidence:'X-1 and X-2, both T8',action:'Check original receipts.',severity:'high'}],next_steps:['Review duplicate receipts','Confirm expenses','Record decision'],limitations:'Not fraud evidence.',answer:''})}]}],usage:{input_tokens:135,output_tokens:140}})};};
- try {const r=response();await handler(safeRequest,r);assert.equal(r.statusCode,200);assert.equal(r.body.report.findings[0].evidence,'X-1 and X-2, both T8');assert.equal(forwarded.url,'https://api.openai.com/v1/responses');assert.equal(forwarded.options.headers.Authorization,'Bearer sk-test-do-not-use-this-key');const b=JSON.parse(forwarded.options.body);assert.equal(b.store,false);assert.equal(b.model,'gpt-6-luna');assert.ok(b.text.format.strict);assert.ok(b.input.find(item => item.role === 'user').content.includes('X-1'));assert.ok(!JSON.stringify(r.body).includes('sk-test'));}finally{global.fetch=old;}
+ const mockReport={headline:'Review',executive_summary:'Two duplicate claims require review.',findings:[{title:'Potential duplicate',impact:'$99 held across two claims.',evidence:'X-1 and X-2, both T8',action:'Check original receipts.',severity:'high'}],next_steps:['Review duplicate receipts','Confirm expenses','Record decision'],limitations:'Not fraud evidence.',answer:''};
+ global.fetch=async(url,options)=>{forwarded={url,options};return {ok:true,status:200,json:async()=>({
+   model:'google/gemma-4-26b-a4b-it:free',
+   choices:[{finish_reason:'stop',message:{role:'assistant',content:JSON.stringify(mockReport)}}],
+   usage:{prompt_tokens:135,completion_tokens:140}
+ })};};
+ try {
+   const r=response();await handler(safeRequest,r);
+   assert.equal(r.statusCode,200);
+   assert.equal(r.body.report.findings[0].evidence,'X-1 and X-2, both T8');
+   assert.equal(r.body.model,'google/gemma-4-26b-a4b-it:free');
+   assert.equal(r.body.usage.input_tokens,135);
+   assert.equal(forwarded.url,'https://openrouter.ai/api/v1/chat/completions');
+   assert.equal(forwarded.options.headers.Authorization,'Bearer sk-or-v1-test-do-not-use-this-key');
+   const b=JSON.parse(forwarded.options.body);
+   assert.equal(b.model,'openrouter/free');
+   assert.ok(b.response_format.json_schema.strict);
+   assert.equal(b.provider.require_parameters,true);
+   assert.ok(b.messages.find(item=>item.role==='user').content.includes('X-1'));
+   assert.ok(!JSON.stringify(r.body).includes('sk-or-v1-test'));
+   assert.ok(!JSON.stringify(b).includes('PRIVATE DESCRIPTION'));
+ }finally{global.fetch=old;}
 });
 test('API returns safe messages for invalid keys and quota errors',async()=>{
  const old=global.fetch;try {for(const [code,pattern]of [[401,/key/i],[429,/quota/i]]){global.fetch=async()=>({ok:false,status:code});const r=response();await handler(safeRequest,r);assert.equal(r.statusCode,code);assert.match(r.body.error,pattern);}}finally{global.fetch=old;}
@@ -65,19 +85,29 @@ test('evidence describes data holds and discloses sampling coverage',()=>{
  assert.ok(!JSON.stringify(evidence).includes('PRIVATE DESCRIPTION'));
 });
 
-test('malformed structured findings and provider refusals fail safely',()=>{
- const wrap=value=>({output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(value)}]}]});
+test('malformed structured findings, refusals and truncated content fail safely',()=>{
+ const wrap=value=>({choices:[{finish_reason:'stop',message:{content:JSON.stringify(value)}}]});
  assert.throws(()=>handler.parseOutput(wrap(null)),/incomplete report/);
  const base={headline:'Review',executive_summary:'Summary',findings:[null],next_steps:['Check'],limitations:'Limited',answer:''};
  assert.throws(()=>handler.parseOutput(wrap(base)),/could not be validated/);
- assert.throws(()=>handler.parseOutput({output:[{type:'message',content:[{type:'refusal',refusal:'provider detail'}]}]}),/declined this request/);
+ assert.throws(()=>handler.parseOutput({choices:[{finish_reason:'stop',message:{refusal:'not possible'}}]}),/declined this request/);
+ assert.throws(()=>handler.parseOutput({choices:[{finish_reason:'length',message:{content:'{}'}}]}),/before finishing/);
 });
 
 test('an exhausted model budget does not render partial findings',async()=>{
  const old=global.fetch;
  try {
-   global.fetch=async()=>({ok:true,status:200,json:async()=>({status:'incomplete',incomplete_details:{reason:'max_output_tokens'},output:[]})});
+   global.fetch=async()=>({ok:true,status:200,json:async()=>({choices:[{finish_reason:'length',message:{content:'{}'}}]})});
    const r=response();await handler(safeRequest,r);
-   assert.equal(r.statusCode,502);assert.match(r.body.error,/response budget/);assert.equal(r.body.report,undefined);
+   assert.equal(r.statusCode,502);assert.match(r.body.error,/stopped before finishing/);assert.equal(r.body.report,undefined);
+ }finally{global.fetch=old;}
+});
+test('OpenAI keys and paid routing models are rejected before contacting upstream',async()=>{
+ const old=global.fetch;global.fetch=async()=>{throw Error('Upstream must not be called');};
+ try {
+  let r=response();await handler({...safeRequest,body:{...safeRequest.body,apiKey:'sk-proj-invalid-openai-key-for-test'}},r);
+  assert.equal(r.statusCode,400);assert.match(r.body.error,/OpenRouter/);
+  r=response();await handler({...safeRequest,body:{...safeRequest.body,model:'openrouter/auto'}},r);
+  assert.equal(r.statusCode,400);assert.match(r.body.error,/Auto Free/);
  }finally{global.fetch=old;}
 });
