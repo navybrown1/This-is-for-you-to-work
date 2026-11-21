@@ -47,8 +47,37 @@ test('API rejects non-POST, cross-origin and malformed / missing keys',async()=>
 test('API proxy forwards key only to OpenAI and requests no server-side model storage',async()=>{
  let forwarded;const old=global.fetch;
  global.fetch=async(url,options)=>{forwarded={url,options};return {ok:true,status:200,json:async()=>({status:'completed',output:[{type:'message',content:[{type:'output_text',text:JSON.stringify({headline:'Review',executive_summary:'Two duplicate claims require review.',findings:[{title:'Potential duplicate',impact:'$99 held across two claims.',evidence:'X-1 and X-2, both T8',action:'Check original receipts.',severity:'high'}],next_steps:['Review duplicate receipts','Confirm expenses','Record decision'],limitations:'Not fraud evidence.',answer:''})}]}],usage:{input_tokens:135,output_tokens:140}})};};
- try {const r=response();await handler(safeRequest,r);assert.equal(r.statusCode,200);assert.equal(r.body.report.findings[0].evidence,'X-1 and X-2, both T8');assert.equal(forwarded.url,'https://api.openai.com/v1/responses');assert.equal(forwarded.options.headers.Authorization,'Bearer sk-test-do-not-use-this-key');const b=JSON.parse(forwarded.options.body);assert.equal(b.store,false);assert.equal(b.model,'gpt-6-luna');assert.ok(b.text.format.strict);assert.ok(b.input[0].content.includes('X-1'));assert.ok(!JSON.stringify(r.body).includes('sk-test'));}finally{global.fetch=old;}
+ try {const r=response();await handler(safeRequest,r);assert.equal(r.statusCode,200);assert.equal(r.body.report.findings[0].evidence,'X-1 and X-2, both T8');assert.equal(forwarded.url,'https://api.openai.com/v1/responses');assert.equal(forwarded.options.headers.Authorization,'Bearer sk-test-do-not-use-this-key');const b=JSON.parse(forwarded.options.body);assert.equal(b.store,false);assert.equal(b.model,'gpt-6-luna');assert.ok(b.text.format.strict);assert.ok(b.input.find(item => item.role === 'user').content.includes('X-1'));assert.ok(!JSON.stringify(r.body).includes('sk-test'));}finally{global.fetch=old;}
 });
 test('API returns safe messages for invalid keys and quota errors',async()=>{
  const old=global.fetch;try {for(const [code,pattern]of [[401,/key/i],[429,/quota/i]]){global.fetch=async()=>({ok:false,status:code});const r=response();await handler(safeRequest,r);assert.equal(r.statusCode,code);assert.match(r.body.error,pattern);}}finally{global.fetch=old;}
+});
+
+test('evidence describes data holds and discloses sampling coverage',()=>{
+ const withDataHold=H.analyze([{...syntheticClaims[0],employee_id:'missing',category:'Hotel',amount_usd:'100.00',nights:''}],employees,{});
+ const evidence=ai.buildEvidence(withDataHold);
+ assert.ok(evidence.data_rules.some(r=>r.code==='R3'&&r.claims===1));
+ assert.ok(evidence.data_rules.some(r=>r.code==='R6'&&r.claims===1));
+ assert.equal(evidence.data_quality.positive_hotel_claims_missing_nights,1);
+ assert.equal(evidence.policy_thresholds.split_minimum_claims,withDataHold.settings.splitMinClaims);
+ assert.ok(evidence.evidence_coverage);
+ assert.ok(evidence.example_priority_claims[0].source_row_number>=2);
+ assert.ok(!JSON.stringify(evidence).includes('PRIVATE DESCRIPTION'));
+});
+
+test('malformed structured findings and provider refusals fail safely',()=>{
+ const wrap=value=>({output:[{type:'message',content:[{type:'output_text',text:JSON.stringify(value)}]}]});
+ assert.throws(()=>handler.parseOutput(wrap(null)),/incomplete report/);
+ const base={headline:'Review',executive_summary:'Summary',findings:[null],next_steps:['Check'],limitations:'Limited',answer:''};
+ assert.throws(()=>handler.parseOutput(wrap(base)),/could not be validated/);
+ assert.throws(()=>handler.parseOutput({output:[{type:'message',content:[{type:'refusal',refusal:'provider detail'}]}]}),/declined this request/);
+});
+
+test('an exhausted model budget does not render partial findings',async()=>{
+ const old=global.fetch;
+ try {
+   global.fetch=async()=>({ok:true,status:200,json:async()=>({status:'incomplete',incomplete_details:{reason:'max_output_tokens'},output:[]})});
+   const r=response();await handler(safeRequest,r);
+   assert.equal(r.statusCode,502);assert.match(r.body.error,/response budget/);assert.equal(r.body.report,undefined);
+ }finally{global.fetch=old;}
 });

@@ -2,7 +2,7 @@
   "version": 2,
   "framework": null,
   "functions": {
-    "api/insights.js": { "maxDuration": 30 }
+    "api/insights.js": { "maxDuration": 60 }
   },
   "headers": [
     {

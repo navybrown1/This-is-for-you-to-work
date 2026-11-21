@@ -17,6 +17,20 @@
   function buildEvidence(report) {
     if (!report || !report.summary || !Array.isArray(report.rows)) throw new Error('Run a valid local review first.');
     const s = report.summary;
+    const ranked = priorityRows(report), selectedClaims = ranked.slice(0, 18);
+    const selectedDepartments = report.departments.slice(0, 16);
+    const dataRuleMap = new Map();
+    report.rows.forEach(row => {
+      const seen = new Set();
+      row.flags.forEach(flag => {
+        if (!/^R(?:[1-9]|10)$/.test(flag.code)) return;
+        if (!dataRuleMap.has(flag.code)) dataRuleMap.set(flag.code, { code: flag.code, labels: new Set(), claims: 0 });
+        const rule = dataRuleMap.get(flag.code);
+        // Labels are fixed checker text; reasons can contain private source values.
+        rule.labels.add(String(flag.label).slice(0, 100));
+        if (!seen.has(flag.code)) { rule.claims++; seen.add(flag.code); }
+      });
+    });
     return {
       source: 'Local deterministic policy checker; summarizes only the currently loaded files',
       currency: 'USD',
@@ -25,7 +39,9 @@
         meal_daily_limit_usd: report.settings.mealLimit,
         hotel_nightly_limit_usd: report.settings.hotelNightLimit,
         submit_within_days: report.settings.daysLimit,
-        entertainment_approval_over_usd: report.settings.entertainmentLimit
+        entertainment_approval_over_usd: report.settings.entertainmentLimit,
+        split_minimum_claims: report.settings.splitMinClaims,
+        duplicate_minimum_claims: report.settings.duplicateMinClaims
       },
       summary: {
         claims: s.claims, held: s.held, unflagged: s.noFlags,
@@ -39,7 +55,19 @@
       rules: Object.entries(report.ruleCounts).map(([code, count]) => ({
         code, label: root.Harborline?.ruleNames?.[code] || code, claims: count
       })),
-      departments: report.departments.slice(0, 16).map(d => ({
+      data_rules: [...dataRuleMap.values()]
+        .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }))
+        .map(rule => ({ code: rule.code, labels: [...rule.labels].slice(0, 4), claims: rule.claims })),
+      evidence_coverage: {
+        all_claims_in_aggregates: true,
+        departments_total: report.departments.length,
+        departments_included: selectedDepartments.length,
+        departments_selection: 'Up to 16 departments, ordered by positive held value. Omitted departments remain in the full summary totals.',
+        positive_held_claims_total: ranked.length,
+        example_claims_included: selectedClaims.length,
+        example_selection: 'Up to 18 positive held claims, ordered by an amount-and-flag review heuristic. This is a selected sample, not all held claims, a random sample, or a fraud score. Refund, zero-dollar, and invalid-amount claims appear in aggregate counts only.'
+      },
+      departments: selectedDepartments.map(d => ({
         department: String(d.department).slice(0, 72), claims: d.claims, held: d.held,
         held_share_percent: Number((100 * d.held / Math.max(1, d.claims)).toFixed(1)),
         positive_on_hold_usd: USD(d.heldPositiveCents), net_submitted_usd: USD(d.netCents)
@@ -56,11 +84,14 @@
         unknown_categories: report.quality.unknownCategories,
         invalid_or_missing_dates: report.quality.invalidDates,
         reversed_dates: report.quality.reversedDates,
+        positive_hotel_claims_missing_nights: report.quality.missingNights,
+        positive_airfare_claims_missing_or_unrecognized_class: report.quality.missingFare,
         duplicate_claim_id_rows: report.quality.duplicateClaimIds,
         invalid_amounts: report.quality.invalidAmounts
       },
-      example_priority_claims: priorityRows(report).slice(0, 18).map(x => ({
+      example_priority_claims: selectedClaims.map(x => ({
         claim_id: String(x.row.claimId).slice(0, 60),
+        source_row_number: x.row.rowNumber,
         category: String(x.row.category).slice(0, 60),
         department: String(x.row.department).slice(0, 70),
         amount_usd: USD(x.row.cents),
@@ -162,6 +193,7 @@
     out.hidden = false;
   }
   async function requestAI(mode) {
+    if (state.busy) return;
     if (!state.evidence) { setStatus('Load and review both CSV files first.', true); return; }
     const key = $('ai-key').value.trim();
     if (!key) { $('ai-key').focus(); setStatus('Enter your OpenAI API key.', true); return; }
@@ -170,6 +202,8 @@
     if (mode === 'question' && !question) { $('ai-question').focus(); setStatus('Enter a question about your review.', true); return; }
     if (location.protocol === 'file:') { setStatus('Open the deployed Vercel site to enable AI requests. Offline local priorities still work.', true); return; }
     stopRequest(); const id = state.serial, controller = new AbortController();state.controller = controller;state.busy = true;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 65000);
     $('ai-run').disabled = true; $('ai-ask').disabled = true; clearResult();
     setStatus(mode === 'question' ? 'Checking your question against the summarized claims…' : 'Generating an evidence-based executive review…');
     try {
@@ -182,15 +216,20 @@
       if (!response.ok) throw new Error(data.error || 'The AI request could not be completed.');
       displayAI(data, mode === 'question');
       setStatus('AI review complete. Cross-check every recommendation against the underlying claim details.');
-    } catch (error) { if (id === state.serial && error.name !== 'AbortError') setStatus(error.message || 'AI analysis could not be completed.', true); }
-    finally { if (id === state.serial) { state.busy = false; state.controller = null; $('ai-run').disabled = false; $('ai-ask').disabled = false; } }
+    } catch (error) {
+      if (id === state.serial) {
+        if (timedOut) setStatus('The AI request timed out. Wait a moment before trying again.', true);
+        else if (error.name !== 'AbortError') setStatus(error.message || 'AI analysis could not be completed.', true);
+      }
+    }
+    finally { clearTimeout(timeout); if (id === state.serial) { state.busy = false; state.controller = null; $('ai-run').disabled = false; $('ai-ask').disabled = false; } }
   }
 
   document.addEventListener('harborline:invalidated', invalidate);
   document.addEventListener('harborline:completed', e => reportReady(e.detail.report));
   $('ai-run').addEventListener('click', () => requestAI('analysis'));
   $('ai-ask').addEventListener('click', () => requestAI('question'));
-  $('ai-question').addEventListener('keydown', e => { if (e.key === 'Enter') requestAI('question'); });
+  $('ai-question').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); requestAI('question'); } });
   $('ai-clear-key').addEventListener('click', () => { $('ai-key').value = ''; $('ai-key').type = 'password'; $('ai-show-key').textContent='Show'; $('ai-show-key').setAttribute('aria-pressed','false'); stopRequest(); setStatus('API key cleared from this page.'); });
   $('ai-show-key').addEventListener('click', () => { const visible = $('ai-key').type === 'password'; $('ai-key').type = visible ? 'text' : 'password'; $('ai-show-key').textContent = visible ? 'Hide' : 'Show'; $('ai-show-key').setAttribute('aria-pressed', visible ? 'true' : 'false'); });
   $('ai-payload-preview').textContent = 'Run a local review to see the evidence.';

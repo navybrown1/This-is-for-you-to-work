@@ -1,73 +1,173 @@
-from pathlib import Path
+"""Smoke-test a real HTTPS deployment without a real key or paid inference.
+
+Required: HARBORLINE_BASE_URL=https://your-deployment.example
+Optional: CHROMIUM_EXECUTABLE_PATH, FINANCE_CLAIMS, FINANCE_EMPLOYEES
+The two FINANCE_* paths must be supplied together and refer to the September
+course dataset. Source code, network responses, and AI findings are not mocked.
+"""
+
 import json
 import os
-from playwright.sync_api import sync_playwright
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from playwright.sync_api import expect, sync_playwright
+
 
 ROOT = Path(__file__).resolve().parents[1]
-results=[]
-console_errors=[]
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True, executable_path='/usr/bin/chromium', args=['--no-sandbox','--disable-dev-shm-usage'])
-    page=browser.new_page(viewport={'width':1440,'height':900},device_scale_factor=1)
-    page.on('pageerror', lambda e: console_errors.append(str(e)))
-    source=(ROOT/'index.html').read_text().replace('<script src="ai-insights.js"></script>','')
-    page.set_content(source, wait_until='load')
-    page.add_script_tag(content=(ROOT/'ai-insights.js').read_text())
-    assert page.locator('#demo').count()==1
-    page.locator('#demo').click()
-    assert page.locator('#kpi-claims').inner_text()=='10'
-    assert page.locator('#ai-local').locator('.ai-stat').count()==3
-    assert page.locator('#ai-payload-preview').text_content().find('DEMO-004')>=0
-    assert page.locator('#ai-payload-preview').text_content().find('Demo Airline')<0
-    assert page.locator('#ai-payload-preview').text_content().find('employee_id')<0
-    results.append('Synthetic demo loaded; local metrics and minimized payload ready')
-    page.locator('#ai-run').click()
-    assert 'Enter your OpenAI API key' in page.locator('#ai-status').inner_text()
-    page.locator('#ai-key').fill('sk-test-one-two-three-four-five')
-    page.locator('#ai-run').click()
-    assert 'consent' in page.locator('#ai-status').inner_text().lower()
-    results.append('API key and explicit consent required before sending data')
-    page.evaluate('''() => { window.__mockCalls=[]; window.fetch=async (path, opts) => {const b=JSON.parse(opts.body); window.__mockCalls.push(b.mode); return {ok:true,json:async()=>({report:{headline:'Evidence-backed finance review',executive_summary:'Review approvals and possible duplicates before settlement.',findings:[{title:'Potential repeated airfare',impact:'Airfare claims require a receipt review.', evidence:'DEMO-004 and DEMO-010 both T8',action:'Compare merchant invoice and tickets.',severity:'high'}],next_steps:['Request receipts','Validate approvals','Document findings'],limitations:'Potential duplicates are unconfirmed.',answer:'Prioritize Airfare T8 matching.'},model:'gpt-6-luna',usage:{input_tokens:485,output_tokens:210}})}; }; }''')
-    page.locator('#ai-consent').check()
-    page.locator('#ai-run').click()
-    page.locator('#ai-output h3').wait_for()
-    assert page.locator('#ai-output h3').inner_text()=='Evidence-backed finance review'
-    assert 'DEMO-004' in page.locator('#ai-output').inner_text()
-    assert 'sk-test-one' not in page.locator('#ai-output').inner_text()
-    results.append('Model-generated findings render safely; no key leaks to findings')
-    page.locator('#ai-question').fill('What should the controller verify first?')
-    page.locator('#ai-ask').click()
-    page.locator('#ai-output h4').first.wait_for()
-    assert 'Prioritize Airfare T8' in page.locator('#ai-output').inner_text()
-    assert page.evaluate('window.__mockCalls')==['analysis','question']
-    results.append('Follow-up finance question hits proxy with restricted evidence only')
-    page.locator('#ai-clear-key').click()
-    assert page.locator('#ai-key').input_value()==''
-    results.append('Clear key removes input and stops outstanding requests')
-    page.screenshot(path=str(ROOT/'tests/screenshot-desktop.png'),full_page=True)
-    page.set_viewport_size({'width':390,'height':844})
-    page.screenshot(path=str(ROOT/'tests/screenshot-mobile.png'),full_page=True)
-    assert page.locator('#ai-run').is_visible()
-    results.append('Desktop and mobile render screenshots captured')
-    # Optional class test data is never committed to the public repository.
-    claims=os.environ.get('FINANCE_CLAIMS', '/mnt/data/Data/expense_claims_sep.csv')
-    employees=os.environ.get('FINANCE_EMPLOYEES', '/mnt/data/Data/employees.csv')
-    if Path(claims).is_file() and Path(employees).is_file():
-        page.set_content(source, wait_until='load')
-        page.add_script_tag(content=(ROOT/'ai-insights.js').read_text())
-        page.locator('#claims-file').set_input_files(claims)
-        page.locator('#employees-file').set_input_files(employees)
-        page.locator('#run').click()
-        assert page.locator('#kpi-claims').inner_text()=='675'
-        assert page.locator('#kpi-held').inner_text()=='127'
-        assert page.locator('#kpi-held-amount').inner_text()=='$33,970.16'
-        evid=json.loads(page.locator('#ai-payload-preview').text_content())
-        assert evid['summary']['claims']==675 and evid['summary']['held']==127
-        assert evid['summary']['positive_value_on_hold_usd']==33970.16
-        assert len(evid['example_priority_claims'])<=18
-        results.append('Real 675-row input passes browser workflow with exact reconciled amounts')
-    else:
-        results.append('Course dataset not present: optional 675-row integration check skipped')
-    assert not console_errors,console_errors
-    print(json.dumps({'status':'PASS','count':len(results),'results':results,'console_errors':console_errors},indent=2))
-    browser.close()
+BASE_URL = os.environ.get("HARBORLINE_BASE_URL", "").strip()
+parsed_url = urlsplit(BASE_URL)
+if (
+    parsed_url.scheme != "https"
+    or not parsed_url.hostname
+    or parsed_url.username
+    or parsed_url.password
+):
+    raise SystemExit("Set HARBORLINE_BASE_URL to the deployment's HTTPS URL.")
+
+claims_path = os.environ.get("FINANCE_CLAIMS", "").strip()
+employees_path = os.environ.get("FINANCE_EMPLOYEES", "").strip()
+if bool(claims_path) != bool(employees_path):
+    raise SystemExit("Set both FINANCE_CLAIMS and FINANCE_EMPLOYEES, or neither.")
+for path in (claims_path, employees_path):
+    if path and not Path(path).expanduser().is_file():
+        raise SystemExit("An optional FINANCE_* path is not a readable file.")
+
+checks = []
+skipped = []
+page_errors = []
+api_requests = []
+
+with sync_playwright() as playwright:
+    launch_options = {"headless": True}
+    executable_path = os.environ.get("CHROMIUM_EXECUTABLE_PATH", "").strip()
+    if executable_path:
+        launch_options["executable_path"] = executable_path
+    browser = playwright.chromium.launch(**launch_options)
+    page = browser.new_page(
+        viewport={"width": 1440, "height": 900}, device_scale_factor=1
+    )
+    page.set_default_timeout(10000)
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+
+    def record_api_request(request):
+        if urlsplit(request.url).path == "/api/insights":
+            # Only record the method. Never capture keys or request bodies.
+            api_requests.append(request.method)
+
+    page.on("request", record_api_request)
+
+    try:
+        response = page.goto(BASE_URL, wait_until="load", timeout=45000)
+        assert response is not None and response.status == 200, (
+            "The deployment did not return HTTP 200."
+        )
+        assert urlsplit(page.url).scheme == "https", "HTTPS was not preserved."
+        expect(page.locator("#demo")).to_be_visible()
+        checks.append("Actual HTTPS deployment and application assets loaded")
+
+        page.locator("#demo").click()
+        expect(page.locator("#kpi-claims")).to_have_text("10")
+        expect(page.locator("#ai-local .ai-stat")).to_have_count(3)
+        evidence = json.loads(page.locator("#ai-payload-preview").text_content())
+        serialized_evidence = json.dumps(evidence)
+        assert "DEMO-004" in serialized_evidence
+        assert "Demo Airline" not in serialized_evidence
+        assert "employee_id" not in serialized_evidence
+        checks.append("Ten-claim demo and minimized AI evidence rendered")
+
+        page.locator("#ai-run").click()
+        expect(page.locator("#ai-status")).to_contain_text(
+            "Enter your OpenAI API key"
+        )
+        assert not api_requests, "An API request was sent without a key."
+
+        # Intentionally too short to pass server validation. This is not a key.
+        page.locator("#ai-key").fill("invalid-short")
+        page.locator("#ai-run").click()
+        expect(page.locator("#ai-status")).to_contain_text("consent")
+        assert not api_requests, "An API request was sent without consent."
+        checks.append("Missing-key and consent gates prevent API requests")
+
+        page.locator("#ai-consent").check()
+        deployment_host = urlsplit(page.url).netloc
+        with page.expect_response(
+            lambda result: (
+                urlsplit(result.url).netloc == deployment_host
+                and urlsplit(result.url).path == "/api/insights"
+                and result.request.method == "POST"
+            ),
+            timeout=15000,
+        ) as invalid_key_response:
+            page.locator("#ai-run").click()
+        rejected = invalid_key_response.value
+        assert rejected.status == 400, "Short invalid key was not rejected."
+        assert "valid OpenAI API key" in rejected.json().get("error", "")
+        expect(page.locator("#ai-status")).to_contain_text("valid OpenAI API key")
+        assert api_requests == ["POST"], "Unexpected number of AI requests."
+        checks.append("Live API route rejects a short non-key before inference")
+
+        page.locator("#ai-clear-key").click()
+        expect(page.locator("#ai-key")).to_have_value("")
+        expect(page.locator("#ai-key")).to_have_attribute("type", "password")
+        checks.append("Clear key removes the input and restores masking")
+
+        page.screenshot(path=str(ROOT / "tests/screenshot-desktop.png"), full_page=True)
+        page.set_viewport_size({"width": 390, "height": 844})
+        expect(page.locator("#ai-run")).to_be_visible()
+        expect(page.locator("#claims-file")).to_be_visible()
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= window.innerWidth"
+        ), "The mobile page overflows horizontally."
+        page.screenshot(path=str(ROOT / "tests/screenshot-mobile.png"), full_page=True)
+        checks.append("Desktop and 390-pixel mobile layout checks passed")
+
+        if claims_path and employees_path:
+            page.locator("#reset").click()
+            page.locator("#claims-file").set_input_files(
+                str(Path(claims_path).expanduser().resolve())
+            )
+            page.locator("#employees-file").set_input_files(
+                str(Path(employees_path).expanduser().resolve())
+            )
+            expect(page.locator("#run")).to_be_enabled()
+            page.locator("#run").click()
+            expect(page.locator("#kpi-claims")).to_have_text("675")
+            expect(page.locator("#kpi-held")).to_have_text("127")
+            expect(page.locator("#kpi-held-amount")).to_have_text("$33,970.16")
+            expect(page.locator("#net-total")).to_have_text("$141,741.97")
+            evidence = json.loads(page.locator("#ai-payload-preview").text_content())
+            assert evidence["summary"]["claims"] == 675
+            assert evidence["summary"]["held"] == 127
+            assert evidence["summary"]["positive_value_on_hold_usd"] == 33970.16
+            assert len(evidence["example_priority_claims"]) <= 18
+            assert api_requests == ["POST"], "Private import triggered an AI request."
+            checks.append("Optional September CSV import reconciled all headline totals")
+        else:
+            skipped.append("September CSV import: FINANCE_* paths were not supplied")
+
+        page.locator("#ai-clear-key").click()
+        page.locator("#reset").click()
+        expect(page.locator("#ai-key")).to_have_value("")
+        expect(page.locator("#results")).to_be_hidden()
+        expect(page.locator("#run")).to_be_disabled()
+        assert not page_errors, page_errors
+        checks.append("Review cleared with no uncaught JavaScript errors")
+        print(json.dumps({
+            "status": "PASS",
+            "scope": "Real deployment smoke test; no real key or model inference",
+            "checks_passed": len(checks),
+            "checks": checks,
+            "skipped": skipped,
+            "page_errors": page_errors,
+        }, indent=2))
+    finally:
+        # Also attempt cleanup if an assertion failed midway through the test.
+        if not page.is_closed():
+            for selector in ("#ai-clear-key", "#reset"):
+                try:
+                    if page.locator(selector).count():
+                        page.locator(selector).click(timeout=1000)
+                except Exception:
+                    pass
+        browser.close()

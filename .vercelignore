@@ -1,0 +1,13 @@
+tests/
+*.md
+Data/
+*.csv
+*.docx
+*.xlsx
+*.zip
+.env
+.env.*
+*.pem
+*.key
+*.log
+__pycache__/

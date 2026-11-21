@@ -24,29 +24,36 @@ An evidence-first **expense compliance checker** with optional AI-assisted revie
 
 ## Key and data privacy
 
-**Local screening sends no CSV data to any server.** The optional AI request sends the entered key and a **reduced JSON snapshot** via HTTPS to this app's same-origin Vercel function (`api/insights.js`), which forwards it to OpenAI's Responses API. The snapshot contains summary totals, policy thresholds, per-department aggregates, rule counts, data-quality counts, and up to 18 claim ID/amount/rule examples. It excludes CSV bytes, employee names and IDs, merchants, raw descriptions, and HR records. The exact JSON is visible before sending. Consent is required for **each newly loaded review**. The AI route requests `store: false` from OpenAI. This does not override OpenAI's API privacy or abuse-monitoring policies.
+**Local screening sends no CSV data to any server.** The optional AI request sends the entered key and a **reduced JSON snapshot** via HTTPS to this app's same-origin Vercel function (`api/insights.js`), which forwards it to OpenAI's Responses API. The snapshot contains summary totals, policy thresholds, up to 16 department aggregates, policy and data-rule counts, data-quality counts, and up to 18 claim ID/source-row/amount/rule examples. Explicit coverage counts disclose every truncation; examples are selected priorities, not a representative sample. It excludes CSV bytes, employee names and IDs, merchants, raw descriptions, and HR records. The exact JSON is visible before sending. Consent is required for **each newly loaded review**. The AI route requests `store: false` from OpenAI. This does not override OpenAI's API privacy or abuse-monitoring policies.
 
-A user-provided API key is held in a password input only and stays in browser memory until cleared or the tab closes. **Never paste a real API key into source code, GitHub issues, screenshots, or chat messages.** This is a public demo, so use an API key with appropriate limits. OpenAI charges API usage according to the account; these charges are distinct from ChatGPT subscriptions.
+The app holds a user-provided API key in the page until cleared or the tab closes. During an AI request it also passes through the Vercel function and to OpenAI; the application does not persist or log it. **Never paste a real API key into source code, GitHub issues, screenshots, or chat messages.** This is a public demo, so use an API key with appropriate limits. OpenAI charges API usage according to the account; these charges are distinct from ChatGPT subscriptions.
 
 The OpenAI prompt instructs the model to treat data as untrusted evidence and not to invent facts, approvals, losses, or fraud claims. AI output is not a substitute for verifying receipts, management approvals, policy versions, and accounting history. No claim is automatically approved or rejected.
 
 ## Deploy to Vercel
 
-Connect this GitHub repository as a new Vercel project with the **Other** framework preset. No build command, special output directory, or API environment variables are required. Vercel serves `index.html` and `ai-insights.js` statically, and deploys `api/insights.js` as a Node serverless function. `vercel.json` sets duration and security headers.
+Connect this GitHub repository as a new Vercel project with the **Other** framework preset. No build command, special output directory, or API environment variables are required. Vercel serves `index.html` and `ai-insights.js` statically, and deploys `api/insights.js` as a Node serverless function. `vercel.json` sets a 60-second function limit and security headers. Node.js 22 is pinned. Preview and individual deployment URLs retain Vercel authentication; the production domain is public. `.vercelignore` keeps tests and documentation out of the served site.
 
 ## Verification
 
 - Original finance engine: 68 independent logic and edge-case regression checks passed using the September course dataset and provided fixtures.
-- API/data minimization: six automated tests in `tests/ai.test.cjs` passed.
-- Browser-level execution (headless Chromium, with source injected because loopback navigation is restricted): seven workflow checks passed, including demo load, consent gate, mocked AI responses, question flow, key clearing, responsive rendering, and real September CSVs.
+- API/data minimization: nine automated tests in `tests/ai.test.cjs` passed, including malformed model output, refusals, partial-output rejection, and evidence coverage.
+- `tests/browser_check.py` checks an actual HTTPS deployment, local demo behavior, API-key and consent gates, server rejection of a deliberately invalid short key, responsive layout, and optional September CSV uploads. It never makes a paid AI call. Run it with `HARBORLINE_BASE_URL` set to the deployment URL; supply `FINANCE_CLAIMS` and `FINANCE_EMPLOYEES` for the optional private dataset check.
 - **A live OpenAI call with a real paid key has not been made.** Mock responses demonstrate the interface and proxy contract without charging anyone. Check the first production API request with a key before relying on AI output.
 
-Run unit tests with `npm test` (Node 20+). The optional browser test is at `tests/browser_check.py` and uses an installed Playwright/Chromium environment; it is not part of the deployment.
+Run unit tests with `npm test` (Node.js 22). The optional browser test is at `tests/browser_check.py` and uses an installed Playwright/Chromium environment; it is not part of the deployment.
+
+## AI request reliability
+
+The proxy uses Structured Outputs, a low reasoning effort and an 8,000-token total output budget. Requests time out after 55 seconds on the server and 65 seconds in the browser. Duplicate submissions are blocked while a request is active. Refusals, malformed findings, and incomplete responses produce explicit errors rather than partial findings. Timeouts and incomplete responses can still incur provider usage; the app does not automatically retry. These limits are engineering choices, not latency guarantees.
 
 ## Provenance / sources
 
 - Local case policy: `TE_Policy.docx` from the user's finance assignment package (not publicly distributed in the repository).
-- [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
+- [OpenAI Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+- [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) and [GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
+- [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
+- [Reasoning tokens and output budgets](https://developers.openai.com/api/docs/guides/reasoning)
 - [OpenAI API pricing](https://platform.openai.com/pricing/)
 
 **Teaching case only.** All determinations require review by a responsible human.
