@@ -1,0 +1,21 @@
+# Do not publish business data, assignments, report exports, or credentials
+Data/
+*.csv
+*.docx
+*.xlsx
+*.zip
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+node_modules/
+.vercel/
+__pycache__/
+*.pyc
+tests/screenshot-*.png
+tests/legacy-regression.json
+patch_app.py
