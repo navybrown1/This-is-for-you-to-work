@@ -189,14 +189,14 @@
       addHeading(out, 'h4', 'Recommended next steps');const ol = node('ol');r.next_steps.forEach(step => ol.append(node('li', step)));out.append(ol);
     }
     if (r.limitations) addParagraph(out, 'Limitations: '+r.limitations, 'ai-caveat');
-    addParagraph(out, `Generated with ${data.model} · ${num(data.usage?.input_tokens)} input tokens · ${num(data.usage?.output_tokens)} output tokens. Usage is billed by OpenAI. Model judgments require independent verification.`, 'ai-meta');
+    addParagraph(out, `Generated with ${data.model} · ${num(data.usage?.input_tokens)} input tokens · ${num(data.usage?.output_tokens)} output tokens. OpenRouter Auto Free model pricing is $0, subject to free-tier limits. Verify all AI judgments.`, 'ai-meta');
     out.hidden = false;
   }
   async function requestAI(mode) {
     if (state.busy) return;
     if (!state.evidence) { setStatus('Load and review both CSV files first.', true); return; }
     const key = $('ai-key').value.trim();
-    if (!key) { $('ai-key').focus(); setStatus('Enter your OpenAI API key.', true); return; }
+    if (!key) { $('ai-key').focus(); setStatus('Enter your OpenRouter API key (sk-or-v1-…).', true); return; }
     if (!$('ai-consent').checked) { $('ai-consent').focus(); setStatus('Review the data-sharing notice and check the consent box first.', true); return; }
     const question = $('ai-question').value.trim();
     if (mode === 'question' && !question) { $('ai-question').focus(); setStatus('Enter a question about your review.', true); return; }
