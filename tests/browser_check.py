@@ -1,14 +1,9 @@
 from pathlib import Path
-from threading import Thread
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from functools import partial
 import json
+import os
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-server = ThreadingHTTPServer(('127.0.0.1', 0), partial(SimpleHTTPRequestHandler, directory=str(ROOT)))
-Thread(target=server.serve_forever, daemon=True).start()
-url = 'http://127.0.0.1:'+str(server.server_address[1])
 results=[]
 console_errors=[]
 with sync_playwright() as p:
@@ -32,17 +27,6 @@ with sync_playwright() as p:
     page.locator('#ai-run').click()
     assert 'consent' in page.locator('#ai-status').inner_text().lower()
     results.append('API key and explicit consent required before sending data')
-    called=[]
-    def mock(route):
-        r=route.request
-        body=r.post_data_json
-        assert body['apiKey']=='sk-test-one-two-three-four-five'
-        assert body['evidence']['summary']['claims']==10
-        assert 'merchant' not in str(body['evidence'])
-        assert body['mode'] in ('question','analysis')
-        called.append(body['mode'])
-        reply={'report':{'headline':'Evidence-backed finance review', 'executive_summary':'Review approvals and possible duplicates before settlement.','findings':[{'title':'Potential repeated airfare', 'impact':'Airfare claims require a receipt review.', 'evidence':'DEMO-004 and DEMO-010 both T8', 'action':'Compare merchant invoice and tickets.', 'severity':'high'}], 'next_steps':['Request receipts','Validate approvals','Document findings'], 'limitations':'Potential duplicates are unconfirmed.', 'answer':'Prioritize Airfare T8 matching.'}, 'model':'gpt-6-luna', 'usage':{'input_tokens':485,'output_tokens':210}}
-        route.fulfill(status=200,content_type='application/json',body=json.dumps(reply))
     page.evaluate('''() => { window.__mockCalls=[]; window.fetch=async (path, opts) => {const b=JSON.parse(opts.body); window.__mockCalls.push(b.mode); return {ok:true,json:async()=>({report:{headline:'Evidence-backed finance review',executive_summary:'Review approvals and possible duplicates before settlement.',findings:[{title:'Potential repeated airfare',impact:'Airfare claims require a receipt review.', evidence:'DEMO-004 and DEMO-010 both T8',action:'Compare merchant invoice and tickets.',severity:'high'}],next_steps:['Request receipts','Validate approvals','Document findings'],limitations:'Potential duplicates are unconfirmed.',answer:'Prioritize Airfare T8 matching.'},model:'gpt-6-luna',usage:{input_tokens:485,output_tokens:210}})}; }; }''')
     page.locator('#ai-consent').check()
     page.locator('#ai-run').click()
@@ -65,21 +49,25 @@ with sync_playwright() as p:
     page.screenshot(path=str(ROOT/'tests/screenshot-mobile.png'),full_page=True)
     assert page.locator('#ai-run').is_visible()
     results.append('Desktop and mobile render screenshots captured')
-    # Real assigned files
-    page.set_content(source, wait_until='load')
-    page.add_script_tag(content=(ROOT/'ai-insights.js').read_text())
-    page.locator('#claims-file').set_input_files('/mnt/data/Data/expense_claims_sep.csv')
-    page.locator('#employees-file').set_input_files('/mnt/data/Data/employees.csv')
-    page.locator('#run').click()
-    assert page.locator('#kpi-claims').inner_text()=='675'
-    assert page.locator('#kpi-held').inner_text()=='127'
-    assert page.locator('#kpi-held-amount').inner_text()=='$33,970.16'
-    evid=json.loads(page.locator('#ai-payload-preview').text_content())
-    assert evid['summary']['claims']==675 and evid['summary']['held']==127
-    assert evid['summary']['positive_value_on_hold_usd']==33970.16
-    assert len(evid['example_priority_claims'])<=18
-    results.append('Real 675-row input passes browser workflow with exact reconciled amounts')
+    # Optional class test data is never committed to the public repository.
+    claims=os.environ.get('FINANCE_CLAIMS', '/mnt/data/Data/expense_claims_sep.csv')
+    employees=os.environ.get('FINANCE_EMPLOYEES', '/mnt/data/Data/employees.csv')
+    if Path(claims).is_file() and Path(employees).is_file():
+        page.set_content(source, wait_until='load')
+        page.add_script_tag(content=(ROOT/'ai-insights.js').read_text())
+        page.locator('#claims-file').set_input_files(claims)
+        page.locator('#employees-file').set_input_files(employees)
+        page.locator('#run').click()
+        assert page.locator('#kpi-claims').inner_text()=='675'
+        assert page.locator('#kpi-held').inner_text()=='127'
+        assert page.locator('#kpi-held-amount').inner_text()=='$33,970.16'
+        evid=json.loads(page.locator('#ai-payload-preview').text_content())
+        assert evid['summary']['claims']==675 and evid['summary']['held']==127
+        assert evid['summary']['positive_value_on_hold_usd']==33970.16
+        assert len(evid['example_priority_claims'])<=18
+        results.append('Real 675-row input passes browser workflow with exact reconciled amounts')
+    else:
+        results.append('Course dataset not present: optional 675-row integration check skipped')
     assert not console_errors,console_errors
     print(json.dumps({'status':'PASS','count':len(results),'results':results,'console_errors':console_errors},indent=2))
     browser.close()
-server.shutdown()
