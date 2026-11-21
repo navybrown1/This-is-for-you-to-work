@@ -78,7 +78,7 @@ with sync_playwright() as playwright:
 
         page.locator("#ai-run").click()
         expect(page.locator("#ai-status")).to_contain_text(
-            "Enter your OpenAI API key"
+            "Enter your OpenRouter API key"
         )
         assert not api_requests, "An API request was sent without a key."
 
@@ -102,8 +102,8 @@ with sync_playwright() as playwright:
             page.locator("#ai-run").click()
         rejected = invalid_key_response.value
         assert rejected.status == 400, "Short invalid key was not rejected."
-        assert "valid OpenAI API key" in rejected.json().get("error", "")
-        expect(page.locator("#ai-status")).to_contain_text("valid OpenAI API key")
+        assert "valid OpenRouter API key" in rejected.json().get("error", "")
+        expect(page.locator("#ai-status")).to_contain_text("valid OpenRouter API key")
         assert api_requests == ["POST"], "Unexpected number of AI requests."
         checks.append("Live API route rejects a short non-key before inference")
 
