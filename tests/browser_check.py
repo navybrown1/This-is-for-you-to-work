@@ -1,9 +1,13 @@
-"""Smoke-test a real HTTPS deployment without a real key or paid inference.
+"""Maintainer smoke test for an actual HTTPS Harborline deployment.
 
 Required: HARBORLINE_BASE_URL=https://your-deployment.example
-Optional: CHROMIUM_EXECUTABLE_PATH, FINANCE_CLAIMS, FINANCE_EMPLOYEES
-The two FINANCE_* paths must be supplied together and refer to the September
-course dataset. Source code, network responses, and AI findings are not mocked.
+Optional: CHROMIUM_EXECUTABLE_PATH, FINANCE_CLAIMS, FINANCE_EMPLOYEES.
+The paired FINANCE_* paths refer to the September course dataset.
+
+No source injection, route mocks, real API keys, or model inference are used.
+The sole AI request contains "bad", a three-character non-key that the server
+must reject before contacting a provider. Run only where browser automation
+is permitted. This script is maintained here, not evidence of a completed run.
 """
 
 import json
@@ -44,50 +48,107 @@ with sync_playwright() as playwright:
     if executable_path:
         launch_options["executable_path"] = executable_path
     browser = playwright.chromium.launch(**launch_options)
-    page = browser.new_page(
-        viewport={"width": 1440, "height": 900}, device_scale_factor=1
-    )
+    page = browser.new_page(viewport={"width": 1440, "height": 1000}, device_scale_factor=1)
     page.set_default_timeout(10000)
     page.on("pageerror", lambda error: page_errors.append(str(error)))
 
     def record_api_request(request):
         if urlsplit(request.url).path == "/api/insights":
-            # Only record the method. Never capture keys or request bodies.
+            # Never record request bodies, keys, headers, or private source rows.
             api_requests.append(request.method)
+
+    def view(name):
+        page.locator('nav [data-view="' + name + '"]').click()
+        expect(page.locator('[data-pane="' + name + '"]')).to_be_visible()
+
+    def preview():
+        return json.loads(page.locator("#ai-payload-preview").text_content())
 
     page.on("request", record_api_request)
 
     try:
         response = page.goto(BASE_URL, wait_until="load", timeout=45000)
-        assert response is not None and response.status == 200, (
-            "The deployment did not return HTTP 200."
-        )
-        assert urlsplit(page.url).scheme == "https", "HTTPS was not preserved."
+        assert response is not None and response.status == 200
+        assert urlsplit(page.url).scheme == "https"
+        view("overview")
         expect(page.locator("#demo")).to_be_visible()
         checks.append("Actual HTTPS deployment and application assets loaded")
 
+        # Connection configuration is available before importing a dataset.
+        view("ai")
+        expect(page.locator("#ai-no-data")).to_be_visible()
+        page.locator("#ai-connect-open").click()
+        expect(page.locator("#ai-provider")).to_have_value("openrouter")
+        expect(page.locator("#ai-model")).to_have_value("openrouter/free")
+        provider_ids = page.locator("#ai-provider option").evaluate_all(
+            "options => options.map(option => option.value)"
+        )
+        assert set(provider_ids) == {
+            "openrouter", "openai", "anthropic", "gemini", "groq",
+            "deepseek", "mistral", "xai", "custom"
+        }
+        page.locator("#ai-provider").select_option("anthropic")
+        page.locator("#ai-key").fill("synthetic-not-a-valid-key")
+        page.locator("#ai-provider").select_option("openai")
+        expect(page.locator("#ai-key")).to_have_value("")
+        page.locator("#ai-provider").select_option("custom")
+        expect(page.locator("#ai-base-url")).to_be_visible()
+        page.locator("#ai-base-url").fill("https://api.example.com/v1")
+        page.locator("#ai-model").fill("example-model")
+        page.locator("#ai-provider").select_option("openrouter")
+        expect(page.locator("#ai-model")).to_have_value("openrouter/free")
+        expect(page.locator("#ai-key")).to_have_value("")
+        assert not api_requests
+        checks.append("Nine connection choices work and provider changes clear the key")
+
+        view("overview")
         page.locator("#demo").click()
         expect(page.locator("#kpi-claims")).to_have_text("10")
-        expect(page.locator("#ai-local .ai-stat")).to_have_count(3)
-        evidence = json.loads(page.locator("#ai-payload-preview").text_content())
-        serialized_evidence = json.dumps(evidence)
-        assert "DEMO-004" in serialized_evidence
-        assert "Demo Airline" not in serialized_evidence
-        assert "employee_id" not in serialized_evidence
-        checks.append("Ten-claim demo and minimized AI evidence rendered")
+        expect(page.locator("#kpi-held")).to_have_text("8")
+        expect(page.locator("#dataset-status")).to_contain_text("SAMPLE DATA")
+        view("ai")
+        expect(page.locator("#ai-local .ai-priority-card")).to_have_count(3)
+        evidence = preview()["evidence"]
+        assert evidence["summary"]["claims"] == 10
+        serialized = json.dumps(evidence)
+        for private_value in ("Demo Airline", '"employee_id"', '"description"', '"merchant"'):
+            assert private_value not in serialized
+        checks.append("Ten-claim demo, calculated priorities, and minimized evidence rendered")
 
-        page.locator("#ai-run").click()
-        expect(page.locator("#ai-status")).to_contain_text(
-            "Enter your OpenRouter API key"
-        )
-        assert not api_requests, "An API request was sent without a key."
+        # Follow a real source row from the queue into its AI investigation.
+        view("claims")
+        first_claim = page.locator("#claim-body [data-row]").first
+        claim_id = first_claim.text_content().strip()
+        first_claim.click()
+        expect(page.locator("#claim-dialog")).to_be_visible()
+        expect(page.locator("#dialog-title")).to_have_text(claim_id)
+        page.locator("#claim-investigate").click()
+        expect(page.locator('[data-pane="ai"]')).to_be_visible()
+        expect(page.locator("#ai-scope")).to_have_value("claim")
+        assert preview()["evidence"]["scope"]["selected_claim_id"] == claim_id
+        page.locator("#ai-open-source").click()
+        expect(page.locator("#dialog-title")).to_have_text(claim_id)
+        page.locator("#close-dialog").click()
+        page.locator("#ai-claim-select").select_option("7")
+        refund = preview()["evidence"]
+        assert refund["scope"]["selected_claim_id"] == "DEMO-008"
+        assert refund["claim_details"][0]["amount_usd"] == -12
+        assert refund["claim_details"][0]["is_refund"] is True
+        assert refund["example_priority_claims"] == []
+        checks.append("Claim investigation links back to source details and supports refunds")
 
-        # Intentionally too short to pass server validation. This is not a key.
-        page.locator("#ai-key").fill("invalid-short")
+        page.locator('[data-ai-task="patterns"]').click()
+        assert preview()["evidence"]["scope"]["type"] == "review"
+        assert preview()["mode"] == "patterns"
+        page.locator('[data-ai-task="analysis"]').click()
         page.locator("#ai-run").click()
-        expect(page.locator("#ai-status")).to_contain_text("consent")
-        assert not api_requests, "An API request was sent without consent."
-        checks.append("Missing-key and consent gates prevent API requests")
+        expect(page.locator("#ai-status")).to_contain_text("Enter the API key issued by")
+        assert not api_requests, "The app sent an API request without a key."
+        page.locator("#ai-key").fill("bad")
+        page.locator("#ai-run").click()
+        expect(page.locator("#ai-status")).to_contain_text("allow data sharing")
+        assert not api_requests, "The app sent an API request without consent."
+        checks.append("Missing-key and consent errors are visible and prevent requests")
 
         page.locator("#ai-consent").check()
         deployment_host = urlsplit(page.url).netloc
@@ -98,31 +159,49 @@ with sync_playwright() as playwright:
                 and result.request.method == "POST"
             ),
             timeout=15000,
-        ) as invalid_key_response:
+        ) as rejected_response:
             page.locator("#ai-run").click()
-        rejected = invalid_key_response.value
-        assert rejected.status == 400, "Short invalid key was not rejected."
-        assert "valid OpenRouter API key" in rejected.json().get("error", "")
-        expect(page.locator("#ai-status")).to_contain_text("valid OpenRouter API key")
-        assert api_requests == ["POST"], "Unexpected number of AI requests."
-        checks.append("Live API route rejects a short non-key before inference")
+        rejected = rejected_response.value
+        assert rejected.status == 400, "The three-character non-key was not rejected."
+        assert "API key issued by" in rejected.json().get("error", "")
+        expect(page.locator("#ai-status")).to_contain_text("API key issued by")
+        expect(page.locator("#ai-output")).to_be_hidden()
+        expect(page.locator("#ai-export")).to_be_disabled()
+        assert api_requests == ["POST"]
+        checks.append("Live API rejects a non-key without displaying invented AI output")
 
         page.locator("#ai-clear-key").click()
         expect(page.locator("#ai-key")).to_have_value("")
         expect(page.locator("#ai-key")).to_have_attribute("type", "password")
-        checks.append("Clear key removes the input and restores masking")
+        expect(page.locator("#ai-consent")).not_to_be_checked()
+        checks.append("Clearing the key restores masking and resets sharing consent")
 
+        view("import")
+        page.locator("#scenario-receipt").fill("100")
+        page.locator("#scenario-meal").fill("100")
+        page.locator("#scenario-hotel").fill("350")
+        page.locator("#scenario-run").click()
+        expect(page.locator("#scenario-output")).to_be_visible()
+        expect(page.locator("#scenario-output")).to_contain_text("not savings")
+        view("overview")
+        expect(page.locator("#kpi-held")).to_have_text("8")
+        checks.append("Policy scenario preview leaves the active review unchanged")
+
+        # Capture synthetic data only, before any optional real CSV import.
         page.screenshot(path=str(ROOT / "tests/screenshot-desktop.png"), full_page=True)
         page.set_viewport_size({"width": 390, "height": 844})
+        for name in ("overview", "claims", "ai", "import"):
+            view(name)
+            assert page.evaluate(
+                "document.documentElement.scrollWidth <= window.innerWidth"
+            ), "Mobile horizontal overflow in " + name
+        view("ai")
         expect(page.locator("#ai-run")).to_be_visible()
-        expect(page.locator("#claims-file")).to_be_visible()
-        assert page.evaluate(
-            "document.documentElement.scrollWidth <= window.innerWidth"
-        ), "The mobile page overflows horizontally."
         page.screenshot(path=str(ROOT / "tests/screenshot-mobile.png"), full_page=True)
-        checks.append("Desktop and 390-pixel mobile layout checks passed")
+        checks.append("All four workspace sections fit a 390-pixel mobile viewport")
 
         if claims_path and employees_path:
+            view("import")
             page.locator("#reset").click()
             page.locator("#claims-file").set_input_files(
                 str(Path(claims_path).expanduser().resolve())
@@ -136,38 +215,33 @@ with sync_playwright() as playwright:
             expect(page.locator("#kpi-held")).to_have_text("127")
             expect(page.locator("#kpi-held-amount")).to_have_text("$33,970.16")
             expect(page.locator("#net-total")).to_have_text("$141,741.97")
-            evidence = json.loads(page.locator("#ai-payload-preview").text_content())
+            evidence = preview()["evidence"]
             assert evidence["summary"]["claims"] == 675
             assert evidence["summary"]["held"] == 127
             assert evidence["summary"]["positive_value_on_hold_usd"] == 33970.16
-            assert len(evidence["example_priority_claims"]) <= 18
-            assert api_requests == ["POST"], "Private import triggered an AI request."
-            checks.append("Optional September CSV import reconciled all headline totals")
+            assert api_requests == ["POST"], "Importing private CSVs triggered an AI request."
+            checks.append("Optional September import reconciled all headline totals")
         else:
             skipped.append("September CSV import: FINANCE_* paths were not supplied")
 
-        page.locator("#ai-clear-key").click()
+        view("import")
         page.locator("#reset").click()
-        expect(page.locator("#ai-key")).to_have_value("")
         expect(page.locator("#results")).to_be_hidden()
         expect(page.locator("#run")).to_be_disabled()
+        view("ai")
+        expect(page.locator("#ai-no-data")).to_be_visible()
+        expect(page.locator("#ai-review-tools")).to_be_hidden()
+        expect(page.locator("#ai-key")).to_have_value("")
         assert not page_errors, page_errors
-        checks.append("Review cleared with no uncaught JavaScript errors")
+        checks.append("Clearing the review invalidates its AI context with no page errors")
         print(json.dumps({
             "status": "PASS",
-            "scope": "Real deployment smoke test; no real key or model inference",
+            "scope": "Actual HTTPS deployment smoke test; no real key or model inference",
             "checks_passed": len(checks),
             "checks": checks,
             "skipped": skipped,
             "page_errors": page_errors,
         }, indent=2))
     finally:
-        # Also attempt cleanup if an assertion failed midway through the test.
-        if not page.is_closed():
-            for selector in ("#ai-clear-key", "#reset"):
-                try:
-                    if page.locator(selector).count():
-                        page.locator(selector).click(timeout=1000)
-                except Exception:
-                    pass
         browser.close()
+
