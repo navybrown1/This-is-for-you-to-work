@@ -1,9 +1,9 @@
 'use strict';
 
-// Vercel's serverless API route. BYOK means the browser supplies an OpenAI key
+// Vercel's serverless API route. BYOK means the browser supplies an OpenRouter key
 // for THIS request only. The key and expense evidence are never persisted here.
-const OPENAI_URL = 'https://api.openai.com/v1/responses';
-const ALLOWED_MODELS = new Set(['gpt-6-luna', 'gpt-6.2-astra']);
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const ALLOWED_MODELS = new Set(['openrouter/free']);
 const OUTPUT_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -43,11 +43,15 @@ function send(res, status, body) {
 }
 
 function parseOutput(data) {
-  const parts = data && Array.isArray(data.output)
-    ? data.output.filter(o => o && o.type === 'message').flatMap(o => Array.isArray(o.content) ? o.content : [])
-    : [];
-  if (parts.some(c => c && c.type === 'refusal')) throw new Error('The model declined this request. Rephrase the question around expense policy and source verification.');
-  const content = parts.filter(c => c && c.type === 'output_text' && typeof c.text === 'string').map(c => c.text).join('');
+  const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+  if (!choice || !choice.message) throw new Error('The model did not return a completed report.');
+  if (choice.finish_reason === 'length') throw new Error('The free model stopped before finishing its report. Try a focused question.');
+  if (choice.finish_reason === 'content_filter') throw new Error('The model declined the request. Rephrase it around expense policy.');
+  if (choice.message.refusal) throw new Error('The model declined this request. Rephrase it around expense policy.');
+  const content = typeof choice.message.content === 'string' ? choice.message.content
+    : Array.isArray(choice.message.content)
+      ? choice.message.content.filter(part => part && part.type === 'text' && typeof part.text === 'string').map(part => part.text).join('')
+      : '';
   if (!content) throw new Error('The model did not return a completed report.');
   let output;
   try { output = JSON.parse(content); } catch { throw new Error('The model returned a response that could not be validated.'); }
@@ -94,8 +98,8 @@ async function handler(req, res) {
   }
   if (!request || typeof request !== 'object' || Array.isArray(request)) return send(res, 400, { error: 'Missing request body.' });
   const { apiKey, mode, model, question, evidence } = request;
-  if (typeof apiKey !== 'string' || apiKey.length < 18 || apiKey.length > 600 || /\s/.test(apiKey)) return send(res, 400, { error: 'Enter a valid OpenAI API key.' });
-  if (!ALLOWED_MODELS.has(model)) return send(res, 400, { error: 'Choose a supported OpenAI model.' });
+  if (typeof apiKey !== 'string' || !apiKey.startsWith('sk-or-') || apiKey.length < 18 || apiKey.length > 600 || /\s/.test(apiKey)) return send(res, 400, { error: 'Enter a valid OpenRouter API key (starts with sk-or-).' });
+  if (!ALLOWED_MODELS.has(model)) return send(res, 400, { error: 'Only OpenRouter Auto Free is allowed.' });
   if (!['analysis', 'question'].includes(mode)) return send(res, 400, { error: 'Invalid analysis mode.' });
   if (mode === 'question' && (typeof question !== 'string' || !question.trim() || question.length > 400)) return send(res, 400, { error: 'Enter a question under 400 characters.' });
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return send(res, 400, { error: 'Run the local expense review first.' });
@@ -105,39 +109,53 @@ async function handler(req, res) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
   try {
-    const upstream = await fetch(OPENAI_URL, {
+    const upstream = await fetch(OPENROUTER_URL, {
       method: 'POST', signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'HTTP-Referer': 'https://harborline-finance-ai.vercel.app',
+        'X-Title': 'Harborline Finance AI'
+      },
       body: JSON.stringify({
-        model,
-        reasoning: { effort: 'low' },
-        input: [
-          { role: 'developer', content: INSTRUCTIONS },
+        model: 'openrouter/free',
+        messages: [
+          { role: 'system', content: INSTRUCTIONS },
           { role: 'user', content: JSON.stringify({ mode, question: mode === 'question' ? question.trim() : '', evidence }) }
         ],
-        text: { format: { type: 'json_schema', name: 'expense_review_insights', strict: true, schema: OUTPUT_SCHEMA } },
-        store: false,
-        max_output_tokens: 8000
+        response_format: { type: 'json_schema', json_schema: { name: 'expense_review_insights', strict: true, schema: OUTPUT_SCHEMA } },
+        provider: { require_parameters: true },
+        max_tokens: 5000,
+        stream: false
       })
     });
     if (!upstream.ok) {
-      const errorMap = { 400: 'OpenAI rejected the model or request. Try the efficient model.', 401: 'OpenAI rejected this API key.', 403: 'This API key does not have access to the selected model.', 429: 'OpenAI rate limit or billing quota reached. Check API credits.', 500: 'OpenAI is temporarily unavailable.', 503: 'OpenAI is temporarily unavailable.' };
-      return send(res, upstream.status >= 500 ? 502 : (upstream.status === 401 ? 401 : upstream.status === 429 ? 429 : 400), { error: errorMap[upstream.status] || 'OpenAI could not process the request.' });
+      const errorMap = {
+        400: 'OpenRouter rejected this request. The free router may not have an available model supporting structured reports.',
+        401: 'OpenRouter rejected this API key. Check it at openrouter.ai/keys.',
+        402: 'OpenRouter reports insufficient free quota or account credits.',
+        403: 'OpenRouter denied this request. Review the key permissions.',
+        404: 'No free model is currently available for this structured report. Try again later.',
+        429: 'OpenRouter free model rate limit or daily quota reached. Please try later.',
+        500: 'OpenRouter is temporarily unavailable.',
+        502: 'OpenRouter is temporarily unavailable.',
+        503: 'OpenRouter is temporarily unavailable.'
+      };
+      const code = upstream.status;
+      return send(res, code >= 500 ? 502 : [400,401,402,403,404,429].includes(code) ? code : 502,
+        { error: errorMap[code] || 'OpenRouter could not process the request.' });
     }
     const data = await upstream.json();
-    if (data.status !== 'completed') {
-      const reason = data.incomplete_details?.reason;
-      return send(res, 502, { error: reason === 'max_output_tokens'
-        ? 'The AI report reached its response budget before completion. Try a focused question or the efficient model. The unfinished response may still incur API usage.'
-        : reason === 'content_filter'
-          ? 'The AI provider could not complete this request. Rephrase it around expense policy and source verification.'
-          : 'The AI report was interrupted or incomplete. Please retry. No partial findings were used.' });
-    }
-    return send(res, 200, { report: parseOutput(data), model, usage: {
-      input_tokens: Number(data.usage?.input_tokens || 0), output_tokens: Number(data.usage?.output_tokens || 0)
-    } });
+    const report = parseOutput(data);
+    return send(res, 200, { report,
+      model: (typeof data.model === 'string' && data.model.length < 150) ? data.model : model,
+      usage: {
+        input_tokens: Number(data.usage?.prompt_tokens || 0),
+        output_tokens: Number(data.usage?.completion_tokens || 0)
+      }
+    });
   } catch (err) {
-    const msg = err && err.name === 'AbortError' ? 'The AI request timed out. Please retry.' : err && /^The model/.test(err.message) ? err.message : 'Could not complete AI analysis. Check your connection and retry.';
+    const msg = err && err.name === 'AbortError' ? 'OpenRouter did not finish within the time limit. Try again later.' : err && /^(The model|The free model)/.test(err.message) ? err.message : 'Could not complete OpenRouter analysis. Check the key, quota and connection.';
     return send(res, 502, { error: msg });
   } finally { clearTimeout(timer); }
 }
